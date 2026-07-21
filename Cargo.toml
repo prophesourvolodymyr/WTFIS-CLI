@@ -1,0 +1,22 @@
+[package]
+name = "wtfis"
+default-run = "wtfis"
+version = "0.1.0"
+edition = "2024"
+description = "Find projects fast from your terminal"
+license = "MIT"
+
+[dependencies]
+crossterm = "0.29"
+dirs = "6"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+walkdir = "2"
+
+[[bin]]
+name = "wtfis"
+path = "src/main.rs"
+
+[[bin]]
+name = "cdd"
+path = "src/main.rs"
