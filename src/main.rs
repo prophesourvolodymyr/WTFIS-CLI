@@ -4,12 +4,15 @@ use std::{
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crossterm::{
     cursor,
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+        MouseButton, MouseEventKind,
+    },
     execute, queue,
     style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor},
     terminal::{self, Clear, ClearType},
@@ -251,13 +254,15 @@ fn picker(
 ) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
     terminal::enable_raw_mode()?;
     let mut out = io::stderr();
-    execute!(out, cursor::SavePosition)?;
+    let (_, origin_row) = cursor::position().unwrap_or((0, 0));
+    execute!(out, cursor::SavePosition, EnableMouseCapture)?;
     let mut query = initial.to_string();
     let mut selected = 0usize;
     let mut rendered_lines = 0usize;
     let mut paths = prepared;
     let mut scan_receiver: Option<Receiver<Vec<PathBuf>>> = None;
     let mut scanning = false;
+    let mut last_click: Option<(usize, Instant)> = None;
     let result = loop {
         if !query.is_empty() && paths.is_none() && scan_receiver.is_none() {
             let roots = roots.to_vec();
@@ -326,12 +331,42 @@ fn picker(
             }) => {
                 query.push(c);
             }
+            Event::Mouse(mouse)
+                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) =>
+            {
+                let terminal_height = terminal::size()
+                    .map(|(_, rows)| rows as usize)
+                    .unwrap_or(24);
+                let visible_count = terminal_height.saturating_sub(11).max(1);
+                let start = if results.len() <= visible_count {
+                    0
+                } else {
+                    selected
+                        .saturating_sub(visible_count - 1)
+                        .min(results.len() - visible_count)
+                };
+                let first_result_row = origin_row as usize + 5;
+                let clicked_row = mouse.row as usize;
+                if clicked_row >= first_result_row
+                    && clicked_row < first_result_row + results.len().min(visible_count)
+                {
+                    let clicked = start + clicked_row - first_result_row;
+                    if last_click.is_some_and(|(previous, time)| {
+                        previous == clicked && time.elapsed() < Duration::from_millis(500)
+                    }) {
+                        break results.get(clicked).map(|item| item.0.clone());
+                    }
+                    selected = clicked;
+                    last_click = Some((clicked, Instant::now()));
+                }
+            }
             _ => {}
         }
     };
     terminal::disable_raw_mode()?;
     execute!(
         out,
+        DisableMouseCapture,
         cursor::RestorePosition,
         Clear(ClearType::FromCursorDown),
         cursor::MoveToColumn(0)
@@ -374,10 +409,11 @@ fn render(
 ) -> io::Result<usize> {
     let _ = rendered_lines;
     let terminal_width = match terminal::size() {
-        Ok((columns, _)) if columns > 0 => columns as usize,
+        Ok((columns, _)) if columns >= 45 => columns as usize,
         _ => 72,
     };
-    let inner_width = terminal_width.saturating_sub(6).max(32);
+    let panel_width = terminal_width.min(78);
+    let inner_width = panel_width.saturating_sub(6).max(32);
     let terminal_height = terminal::size()
         .map(|(_, rows)| rows as usize)
         .unwrap_or(24);
