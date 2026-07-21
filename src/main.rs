@@ -88,25 +88,14 @@ fn scan(roots: &[PathBuf], scan_hidden: bool) -> Vec<PathBuf> {
         for entry in WalkDir::new(root)
             .follow_links(false)
             .into_iter()
+            .filter_entry(|entry| !ignored_directory(entry.path(), scan_hidden))
             .filter_map(Result::ok)
         {
             if !entry.file_type().is_dir() || entry.depth() == 0 {
                 continue;
             }
             let path = entry.path();
-            if !scan_hidden
-                && path
-                    .components()
-                    .any(|part| part.as_os_str().to_string_lossy().starts_with('.'))
-            {
-                continue;
-            }
-            if path.file_name().is_some_and(|name| {
-                matches!(
-                    name.to_string_lossy().as_ref(),
-                    "node_modules" | "target" | "build" | "dist" | ".git"
-                )
-            }) {
+            if ignored_directory(path, scan_hidden) {
                 continue;
             }
             paths.push(path.to_path_buf());
@@ -115,6 +104,22 @@ fn scan(roots: &[PathBuf], scan_hidden: bool) -> Vec<PathBuf> {
     paths.sort();
     paths.dedup();
     paths
+}
+
+fn ignored_directory(path: &Path, scan_hidden: bool) -> bool {
+    if !scan_hidden
+        && path
+            .components()
+            .any(|part| part.as_os_str().to_string_lossy().starts_with('.'))
+    {
+        return true;
+    }
+    path.file_name().is_some_and(|name| {
+        matches!(
+            name.to_string_lossy().as_ref(),
+            "node_modules" | "target" | "build" | "dist" | "vendor" | ".git"
+        )
+    })
 }
 
 fn rank(paths: &[PathBuf], query: &str) -> Vec<(PathBuf, i64)> {
@@ -171,10 +176,11 @@ fn picker(paths: &[PathBuf], initial: &str) -> Result<Option<PathBuf>, Box<dyn s
     let mut out = io::stderr();
     let mut query = initial.to_string();
     let mut selected = 0usize;
+    let mut rendered_lines = 0usize;
     let result = loop {
         let results = rank(paths, &query);
         selected = selected.min(results.len().saturating_sub(1));
-        render(&mut out, &query, &results, selected)?;
+        rendered_lines = render(&mut out, &query, &results, selected, rendered_lines)?;
         if !event::poll(Duration::from_millis(100))? {
             continue;
         }
@@ -221,7 +227,15 @@ fn render(
     query: &str,
     results: &[(PathBuf, i64)],
     selected: usize,
-) -> io::Result<()> {
+    rendered_lines: usize,
+) -> io::Result<usize> {
+    if rendered_lines > 0 {
+        queue!(
+            out,
+            cursor::MoveUp(rendered_lines as u16),
+            cursor::MoveToColumn(0)
+        )?;
+    }
     queue!(
         out,
         cursor::MoveToColumn(0),
@@ -253,6 +267,15 @@ fn render(
             Print("\n")
         )?;
     }
+    if results.is_empty() {
+        queue!(
+            out,
+            SetForegroundColor(Color::DarkGrey),
+            Print("    No matching folders"),
+            ResetColor,
+            Print("\n")
+        )?;
+    }
     queue!(
         out,
         SetForegroundColor(Color::DarkGrey),
@@ -260,7 +283,8 @@ fn render(
         ResetColor,
         cursor::MoveToColumn(0)
     )?;
-    out.flush()
+    out.flush()?;
+    Ok(results.len() + 2 + usize::from(results.is_empty()))
 }
 fn clear_inline(out: &mut impl Write) -> io::Result<()> {
     execute!(
