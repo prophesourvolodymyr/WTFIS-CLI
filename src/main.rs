@@ -77,7 +77,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if exact.len() == 1 {
             let path = exact[0].clone();
             remember(&mut config, path.clone())?;
-            println!("{}", path.display());
+            emit_path(&path)?;
             return Ok(());
         }
     }
@@ -97,7 +97,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     if let Some(path) = selected {
         remember(&mut config, path.clone())?;
-        println!("{}", path.display());
+        emit_path(&path)?;
     }
     Ok(())
 }
@@ -401,6 +401,15 @@ fn remember(config: &mut Config, path: PathBuf) -> Result<(), Box<dyn std::error
         fs::create_dir_all(parent)?;
     }
     fs::write(path, toml::to_string_pretty(config)?)?;
+    Ok(())
+}
+
+fn emit_path(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    if let Ok(output_path) = env::var("WTFIS_OUTPUT") {
+        fs::write(output_path, format!("{}\n", path.display()))?;
+    } else {
+        println!("{}", path.display());
+    }
     Ok(())
 }
 
