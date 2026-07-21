@@ -1,6 +1,6 @@
 use std::{
     env, fs,
-    io::{self, IsTerminal, Write},
+    io::{self, IsTerminal},
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver},
     thread,
@@ -13,17 +13,15 @@ use crossterm::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
         MouseButton, MouseEventKind,
     },
-    execute, queue,
-    style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor},
-    terminal::{self, Clear, ClearType},
+    execute, terminal,
 };
 use ratatui::{
     Terminal, TerminalOptions, Viewport,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
-    style::{Color as TuiColor, Modifier, Style},
+    layout::{Constraint, Direction, Layout, Position, Rect},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, List, ListItem, Paragraph},
 };
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
@@ -52,6 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.first().is_some_and(|arg| arg == "--set") {
         return settings();
     }
+
     let query = args.join(" ");
     let mut config = load_config();
     let roots = config.roots.clone().unwrap_or_else(default_roots);
@@ -65,6 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             config.exact_depth,
         ))
     };
+
     if let Some(projects) = &projects {
         let exact: Vec<_> = projects
             .iter()
@@ -80,19 +80,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
     }
-    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() || !io::stderr().is_terminal() {
         if query.is_empty() {
             return Ok(());
         }
         return print_best(projects.as_deref().unwrap_or_default(), &query);
     }
+
     let selected = picker(
         &roots,
         config.scan_hidden.unwrap_or(false),
         config.exact_depth,
         &recent,
         &query,
-        projects,
     )?;
     if let Some(path) = selected {
         remember(&mut config, path.clone())?;
@@ -103,15 +104,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn default_roots() -> Vec<PathBuf> {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
-    // V1 searches the complete home directory by default. Users can narrow
-    // this with `wtfis --set`; this avoids silently missing projects in an
-    // uncommon folder while keeping the scan away from system directories.
     vec![home]
 }
 
 fn config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|dir| dir.join("wtfis/config.toml"))
 }
+
 fn load_config() -> Config {
     config_path()
         .and_then(|path| fs::read_to_string(path).ok())
@@ -123,6 +122,7 @@ fn scan(roots: &[PathBuf], scan_hidden: bool, exact_depth: Option<usize>) -> Vec
     if let Some(depth) = exact_depth {
         return scan_exact_depth(roots, scan_hidden, depth);
     }
+
     let mut paths = Vec::new();
     for root in roots {
         let walker = WalkDir::new(root)
@@ -140,10 +140,9 @@ fn scan(roots: &[PathBuf], scan_hidden: bool, exact_depth: Option<usize>) -> Vec
                 continue;
             }
             let path = entry.path();
-            if ignored_directory(path, scan_hidden) {
-                continue;
+            if !ignored_directory(path, scan_hidden) {
+                paths.push(path.to_path_buf());
             }
-            paths.push(path.to_path_buf());
         }
     }
     paths.sort();
@@ -227,6 +226,7 @@ fn fuzzy_score(path: &Path, query: &str) -> Option<i64> {
     if name.contains(query) {
         return Some(6_000 - name.len() as i64);
     }
+
     let mut score = 0;
     let mut cursor = 0;
     let chars: Vec<_> = text.chars().collect();
@@ -256,148 +256,18 @@ fn picker(
     exact_depth: Option<usize>,
     recent: &[PathBuf],
     initial: &str,
-    prepared: Option<Vec<PathBuf>>,
 ) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
-    terminal::enable_raw_mode()?;
     let height = terminal::size()
-        .map(|(_, rows)| rows.clamp(12, 20))
-        .unwrap_or(16);
-    let backend = CrosstermBackend::new(io::stdout());
-    let mut ui_terminal = match Terminal::with_options(
-        backend,
-        TerminalOptions {
-            viewport: Viewport::Inline(height),
-        },
-    ) {
-        Ok(terminal) => terminal,
-        Err(error) => {
-            terminal::disable_raw_mode()?;
-            eprintln!("wtfis: inline viewport unavailable ({error}); using compatible mode");
-            return picker_compatible(roots, scan_hidden, exact_depth, recent, initial, prepared);
-        }
-    };
-    execute!(ui_terminal.backend_mut(), EnableMouseCapture)?;
+        .map(|(_, rows)| rows.clamp(7, 12))
+        .unwrap_or(8);
+    let mut session = UiSession::new(height)?;
     let mut query = initial.to_string();
     let mut selected = 0usize;
-    let mut paths = prepared;
+    let mut paths = None;
     let mut scan_receiver: Option<Receiver<Vec<PathBuf>>> = None;
     let mut scanning = false;
     let mut last_click: Option<(usize, Instant)> = None;
-    let result = loop {
-        if !query.is_empty() && paths.is_none() && scan_receiver.is_none() {
-            let roots = roots.to_vec();
-            scan_receiver = Some(start_scan(roots, scan_hidden, exact_depth));
-            scanning = true;
-        }
-        if let Some(receiver) = &scan_receiver {
-            if let Ok(found_paths) = receiver.try_recv() {
-                paths = Some(found_paths);
-                scan_receiver = None;
-                scanning = false;
-            }
-        }
-        let recent_results: Vec<_> = recent
-            .iter()
-            .take(MAX_RECENTS)
-            .cloned()
-            .map(|path| (path, 0))
-            .collect();
-        let results = if query.is_empty() {
-            recent_results
-        } else {
-            rank(paths.as_deref().unwrap_or_default(), &query)
-        };
-        selected = selected.min(results.len().saturating_sub(1));
-        ui_terminal.draw(|frame| render_frame(frame, &query, &results, selected, scanning))?;
-        if !event::poll(Duration::from_millis(100))? {
-            continue;
-        }
-        match event::read()? {
-            Event::Key(KeyEvent {
-                code: KeyCode::Esc, ..
-            }) => break None,
-            Event::Key(KeyEvent {
-                code: KeyCode::Enter,
-                ..
-            }) => break results.get(selected).map(|item| item.0.clone()),
-            Event::Key(KeyEvent {
-                code: KeyCode::Up, ..
-            }) => selected = selected.saturating_sub(1),
-            Event::Key(KeyEvent {
-                code: KeyCode::Down,
-                ..
-            }) => selected = (selected + 1).min(results.len().saturating_sub(1)),
-            Event::Key(KeyEvent {
-                code: KeyCode::Backspace,
-                ..
-            }) => {
-                query.pop();
-            }
-            Event::Key(KeyEvent {
-                code: KeyCode::Char('c'),
-                modifiers,
-                ..
-            }) if modifiers.contains(KeyModifiers::CONTROL) => break None,
-            Event::Key(KeyEvent {
-                code: KeyCode::Char(c),
-                ..
-            }) => {
-                query.push(c);
-            }
-            Event::Mouse(mouse)
-                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) =>
-            {
-                let viewport = ui_terminal.get_frame().area();
-                let visible_count = viewport.height.saturating_sub(8).max(1) as usize;
-                let start = if results.len() <= visible_count {
-                    0
-                } else {
-                    selected
-                        .saturating_sub(visible_count - 1)
-                        .min(results.len() - visible_count)
-                };
-                let first_result_row = viewport.y as usize + 4;
-                let clicked_row = mouse.row as usize;
-                if clicked_row >= first_result_row
-                    && clicked_row < first_result_row + results.len().min(visible_count)
-                {
-                    let clicked = start + clicked_row - first_result_row;
-                    if last_click.is_some_and(|(previous, time)| {
-                        previous == clicked && time.elapsed() < Duration::from_millis(500)
-                    }) {
-                        break results.get(clicked).map(|item| item.0.clone());
-                    }
-                    selected = clicked;
-                    last_click = Some((clicked, Instant::now()));
-                }
-            }
-            _ => {}
-        }
-    };
-    terminal::disable_raw_mode()?;
-    execute!(ui_terminal.backend_mut(), DisableMouseCapture)?;
-    ui_terminal.clear()?;
-    ui_terminal.show_cursor()?;
-    Ok(result)
-}
 
-fn picker_compatible(
-    roots: &[PathBuf],
-    scan_hidden: bool,
-    exact_depth: Option<usize>,
-    recent: &[PathBuf],
-    initial: &str,
-    prepared: Option<Vec<PathBuf>>,
-) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
-    terminal::enable_raw_mode()?;
-    let mut out = io::stderr();
-    execute!(out, cursor::SavePosition)?;
-    let mut query = initial.to_string();
-    let mut selected = 0usize;
-    let mut rendered_lines = 0usize;
-    let mut paths = prepared;
-    let mut scan_receiver: Option<Receiver<Vec<PathBuf>>> = None;
-    let mut scanning = false;
     let result = loop {
         if !query.is_empty() && paths.is_none() && scan_receiver.is_none() {
             scan_receiver = Some(start_scan(roots.to_vec(), scan_hidden, exact_depth));
@@ -410,6 +280,7 @@ fn picker_compatible(
                 scanning = false;
             }
         }
+
         let recent_results: Vec<_> = recent
             .iter()
             .take(MAX_RECENTS)
@@ -422,14 +293,12 @@ fn picker_compatible(
             rank(paths.as_deref().unwrap_or_default(), &query)
         };
         selected = selected.min(results.len().saturating_sub(1));
-        rendered_lines = render(
-            &mut out,
-            &query,
-            &results,
-            selected,
-            rendered_lines,
-            scanning,
-        )?;
+
+        let mut results_area = Rect::default();
+        session.terminal.draw(|frame| {
+            results_area = render_frame(frame, &query, &results, selected, scanning);
+        })?;
+
         if !event::poll(Duration::from_millis(100))? {
             continue;
         }
@@ -463,17 +332,111 @@ fn picker_compatible(
                 code: KeyCode::Char(c),
                 ..
             }) => query.push(c),
+            Event::Mouse(mouse)
+                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) =>
+            {
+                let visible_count = results_area.height as usize;
+                let start = result_start(results.len(), selected, visible_count);
+                if results_area.contains(Position::new(mouse.column, mouse.row)) {
+                    let clicked = start + mouse.row.saturating_sub(results_area.y) as usize;
+                    if clicked >= results.len() {
+                        continue;
+                    }
+                    if last_click.is_some_and(|(previous, time)| {
+                        previous == clicked && time.elapsed() < Duration::from_millis(500)
+                    }) {
+                        break results.get(clicked).map(|item| item.0.clone());
+                    }
+                    selected = clicked;
+                    last_click = Some((clicked, Instant::now()));
+                }
+            }
             _ => {}
         }
     };
-    terminal::disable_raw_mode()?;
-    execute!(
-        out,
-        cursor::RestorePosition,
-        Clear(ClearType::FromCursorDown),
-        cursor::MoveToColumn(0)
-    )?;
+
+    session.cleanup()?;
     Ok(result)
+}
+
+struct UiSession {
+    terminal: Terminal<CrosstermBackend<io::Stdout>>,
+    mouse_capture: bool,
+    raw_mode: bool,
+    cleaned: bool,
+}
+
+impl UiSession {
+    fn new(height: u16) -> io::Result<Self> {
+        terminal::enable_raw_mode()?;
+        let mut backend = CrosstermBackend::new(io::stdout());
+        if let Err(error) = execute!(backend, cursor::SavePosition) {
+            let _ = terminal::disable_raw_mode();
+            return Err(error);
+        }
+
+        let terminal = match Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(height),
+            },
+        ) {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                let _ = execute!(io::stdout(), cursor::RestorePosition);
+                let _ = terminal::disable_raw_mode();
+                return Err(error);
+            }
+        };
+        let mut session = Self {
+            terminal,
+            mouse_capture: false,
+            raw_mode: true,
+            cleaned: false,
+        };
+        if let Err(error) = execute!(session.terminal.backend_mut(), EnableMouseCapture) {
+            let _ = session.cleanup();
+            return Err(error);
+        }
+        session.mouse_capture = true;
+        Ok(session)
+    }
+
+    fn cleanup(&mut self) -> io::Result<()> {
+        if self.cleaned {
+            return Ok(());
+        }
+        let mut first_error = None;
+        if self.mouse_capture {
+            if let Err(error) = execute!(self.terminal.backend_mut(), DisableMouseCapture) {
+                first_error = Some(error);
+            }
+            self.mouse_capture = false;
+        }
+        if let Err(error) = self.terminal.clear() {
+            first_error.get_or_insert(error);
+        }
+        if let Err(error) = execute!(self.terminal.backend_mut(), cursor::RestorePosition) {
+            first_error.get_or_insert(error);
+        }
+        if let Err(error) = self.terminal.show_cursor() {
+            first_error.get_or_insert(error);
+        }
+        if self.raw_mode {
+            if let Err(error) = terminal::disable_raw_mode() {
+                first_error.get_or_insert(error);
+            }
+            self.raw_mode = false;
+        }
+        self.cleaned = true;
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
+impl Drop for UiSession {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+    }
 }
 
 fn start_scan(
@@ -488,11 +451,120 @@ fn start_scan(
     receiver
 }
 
+fn result_start(total: usize, selected: usize, visible: usize) -> usize {
+    if visible == 0 || total <= visible {
+        0
+    } else {
+        selected.saturating_sub(visible - 1).min(total - visible)
+    }
+}
+
+fn render_frame(
+    frame: &mut ratatui::Frame<'_>,
+    query: &str,
+    results: &[(PathBuf, i64)],
+    selected: usize,
+    scanning: bool,
+) -> Rect {
+    let area = frame.area();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" WTFIS ")
+        .title_bottom(" local project finder ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    let label = if query.is_empty() {
+        "Recent projects ["
+    } else {
+        "Search projects ["
+    };
+    let input = Line::from(vec![
+        Span::styled(label, Style::default().fg(Color::White)),
+        Span::styled(query, Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled("]", Style::default().fg(Color::Cyan)),
+    ]);
+    let cursor_line = Line::from(vec![Span::raw(label), Span::raw(query)]);
+    let cursor_x = sections[0]
+        .x
+        .saturating_add(cursor_line.width().min(u16::MAX as usize) as u16)
+        .min(sections[0].right().saturating_sub(1));
+    frame.render_widget(Paragraph::new(input), sections[0]);
+    frame.set_cursor_position(Position::new(cursor_x, sections[0].y));
+
+    frame.render_widget(
+        Paragraph::new("Up/Down navigate  Enter open  Esc cancel  Click select  Double-click open")
+            .style(Style::default().fg(Color::DarkGray)),
+        sections[1],
+    );
+
+    let visible = sections[2].height as usize;
+    let start = result_start(results.len(), selected, visible);
+    let end = (start + visible).min(results.len());
+    if start == end {
+        let message = if scanning {
+            "Scanning folders..."
+        } else if query.is_empty() {
+            "Type to search folders"
+        } else {
+            "No matching folders"
+        };
+        frame.render_widget(
+            Paragraph::new(message).style(Style::default().fg(Color::DarkGray)),
+            sections[2],
+        );
+    } else {
+        let items: Vec<ListItem> = results[start..end]
+            .iter()
+            .enumerate()
+            .map(|(index, (path, _))| {
+                let actual = start + index;
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                let style = if actual == selected {
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(if actual == selected { "> " } else { "  " }, style),
+                    Span::styled(name, style),
+                    Span::styled("  ", style),
+                    Span::styled(path.display().to_string(), style),
+                ]))
+            })
+            .collect();
+        frame.render_widget(List::new(items), sections[2]);
+    }
+
+    let footer = if results.is_empty() {
+        "No selection".to_string()
+    } else {
+        format!("{}-{} of {}", start + 1, end, results.len())
+    };
+    frame.render_widget(
+        Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
+        sections[3],
+    );
+    sections[2]
+}
+
 fn remember(config: &mut Config, path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let recent = config.recent.get_or_insert_with(Vec::new);
     recent.retain(|item| item != &path);
     recent.insert(0, path);
-    recent.truncate(5);
+    recent.truncate(MAX_RECENTS);
     let path = config_path().ok_or("cannot determine config directory")?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -510,306 +582,6 @@ fn emit_path(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn render_frame(
-    frame: &mut ratatui::Frame<'_>,
-    query: &str,
-    results: &[(PathBuf, i64)],
-    selected: usize,
-    scanning: bool,
-) {
-    let block = ratatui::widgets::Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(TuiColor::Cyan))
-        .title(" ◆  W T F I S ")
-        .title_bottom(" where the fuck is your project? ");
-    let inner = block.inner(frame.area());
-    frame.render_widget(block, frame.area());
-    let sections = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
-        .split(inner);
-    let label = if query.is_empty() {
-        "Recent projects  ["
-    } else {
-        "Search projects  ["
-    };
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(label, Style::default().fg(TuiColor::White)),
-            Span::styled(query, Style::default().add_modifier(Modifier::BOLD)),
-            Span::styled("|]", Style::default().fg(TuiColor::Cyan)),
-        ])),
-        sections[0],
-    );
-    frame.render_widget(
-        Paragraph::new("  ↑/↓ navigate  Enter open  Esc cancel")
-            .style(Style::default().fg(TuiColor::DarkGray)),
-        sections[1],
-    );
-    let visible_count = sections[3].height.max(1) as usize;
-    let start = if results.len() <= visible_count {
-        0
-    } else {
-        selected
-            .saturating_sub(visible_count - 1)
-            .min(results.len() - visible_count)
-    };
-    let end = (start + visible_count).min(results.len());
-    let items: Vec<ListItem> = results[start..end]
-        .iter()
-        .enumerate()
-        .map(|(index, (path, _))| {
-            let actual = start + index;
-            let row = format!(
-                "{} ▸ {}  {}",
-                if actual == selected { "›" } else { " " },
-                path.file_name().unwrap_or_default().to_string_lossy(),
-                path.display()
-            );
-            let style = if actual == selected {
-                Style::default()
-                    .fg(TuiColor::White)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(TuiColor::DarkGray)
-            };
-            ListItem::new(Line::from(Span::styled(row, style)))
-        })
-        .collect();
-    if items.is_empty() {
-        let message = if scanning {
-            "  ◌  Scanning folders..."
-        } else if query.is_empty() {
-            "  ◇  Type to search folders"
-        } else {
-            "  ×  No matching folders"
-        };
-        frame.render_widget(
-            Paragraph::new(message).style(Style::default().fg(TuiColor::DarkGray)),
-            sections[3],
-        );
-    } else {
-        frame.render_widget(List::new(items), sections[3]);
-    }
-    let navigation = if results.is_empty() {
-        "↑/↓ navigate  Enter open  Esc cancel".to_string()
-    } else {
-        format!(
-            "{}-{} of {}  ↑/↓ navigate  Enter open  Esc cancel",
-            start + 1,
-            end,
-            results.len()
-        )
-    };
-    frame.render_widget(
-        Paragraph::new(navigation).style(Style::default().fg(TuiColor::DarkGray)),
-        sections[4],
-    );
-}
-
-fn render(
-    out: &mut impl Write,
-    query: &str,
-    results: &[(PathBuf, i64)],
-    selected: usize,
-    rendered_lines: usize,
-    scanning: bool,
-) -> io::Result<usize> {
-    let _ = rendered_lines;
-    let terminal_width = match terminal::size() {
-        Ok((columns, _)) if columns >= 45 => columns as usize,
-        _ => 72,
-    };
-    let panel_width = terminal_width.min(78);
-    let inner_width = panel_width.saturating_sub(6).max(32);
-    let terminal_height = terminal::size()
-        .map(|(_, rows)| rows as usize)
-        .unwrap_or(24);
-    let visible_count = terminal_height.saturating_sub(11).max(1);
-    let start = if results.len() <= visible_count {
-        0
-    } else {
-        selected
-            .saturating_sub(visible_count - 1)
-            .min(results.len() - visible_count)
-    };
-    let end = (start + visible_count).min(results.len());
-    let search_label = if query.is_empty() {
-        "Recent projects  ["
-    } else {
-        "Search projects  ["
-    };
-    let query_width = inner_width.saturating_sub(search_label.chars().count() + 2);
-    let displayed_query = truncate_line(query, query_width);
-    let search_padding = inner_width
-        .saturating_sub(search_label.chars().count() + displayed_query.chars().count() + 2);
-    queue!(
-        out,
-        cursor::RestorePosition,
-        cursor::MoveToColumn(0),
-        Clear(ClearType::FromCursorDown),
-        Print(box_border(inner_width, '-')),
-        Print("\n"),
-        SetForegroundColor(Color::Cyan),
-        Print(box_text("  ◆  W T F I S", inner_width)),
-        ResetColor,
-        Print("\n"),
-        SetForegroundColor(Color::DarkGrey),
-        Print(box_text(
-            "     where the fuck is your project?",
-            inner_width
-        )),
-        ResetColor,
-        Print("\n"),
-        SetForegroundColor(Color::Cyan),
-        Print("  | "),
-        ResetColor,
-        Print(search_label),
-        SetAttribute(Attribute::Bold),
-        Print(displayed_query),
-        SetForegroundColor(Color::Cyan),
-        Print("|"),
-        ResetColor,
-        Print("]"),
-        Print(&" ".repeat(search_padding)),
-        SetForegroundColor(Color::Cyan),
-        Print(" |\n"),
-        ResetColor,
-        Print(box_border(inner_width, '-')),
-        Print("\n")
-    )?;
-    for (index, (path, _)) in results[start..end].iter().enumerate() {
-        let actual_index = start + index;
-        let name = fit_name(path.file_name().unwrap_or_default().to_string_lossy());
-        let path_text = fit_path(path, name.chars().count());
-        let row = format!("▸ {}  {}", name, path_text);
-        queue!(
-            out,
-            SetForegroundColor(if actual_index == selected {
-                Color::White
-            } else {
-                Color::DarkGrey
-            }),
-            SetAttribute(if actual_index == selected {
-                Attribute::Bold
-            } else {
-                Attribute::Reset
-            }),
-            Print(box_text_with_marker(
-                &row,
-                inner_width,
-                actual_index == selected,
-            )),
-            SetAttribute(Attribute::Reset),
-            ResetColor,
-            Print("\n")
-        )?;
-    }
-    if results.is_empty() {
-        queue!(
-            out,
-            SetForegroundColor(Color::DarkGrey),
-            Print(box_text(
-                if scanning {
-                    "  ◌  Scanning folders..."
-                } else if query.is_empty() {
-                    "  ◇  Type to search folders"
-                } else {
-                    "  ×  No matching folders"
-                },
-                inner_width
-            )),
-            ResetColor,
-            Print("\n")
-        )?;
-    }
-    let navigation = if results.is_empty() {
-        "  ↑/↓ navigate  Enter open  Esc cancel".to_string()
-    } else {
-        format!(
-            "  {}-{} of {}  ↑/↓ navigate  Enter open  Esc cancel",
-            start + 1,
-            end,
-            results.len()
-        )
-    };
-    queue!(
-        out,
-        SetForegroundColor(Color::DarkGrey),
-        Print(box_text(&navigation, inner_width)),
-        ResetColor,
-        Print("\n"),
-        SetForegroundColor(Color::Cyan),
-        Print(box_border(inner_width, '-')),
-        ResetColor
-    )?;
-    out.flush()?;
-    Ok(end.saturating_sub(start) + 6 + usize::from(results.is_empty()))
-}
-
-fn box_border(inner_width: usize, character: char) -> String {
-    format!("  +{}+", character.to_string().repeat(inner_width + 2))
-}
-
-fn box_text(text: &str, inner_width: usize) -> String {
-    let text = truncate_line(text, inner_width);
-    format!(
-        "  | {}{} |",
-        text,
-        " ".repeat(inner_width.saturating_sub(text.chars().count()))
-    )
-}
-
-fn truncate_line(text: &str, available: usize) -> String {
-    if text.chars().count() <= available {
-        return text.to_string();
-    }
-    let prefix: String = text.chars().take(available.saturating_sub(3)).collect();
-    format!("{prefix}...")
-}
-
-fn box_text_with_marker(text: &str, inner_width: usize, selected: bool) -> String {
-    let marker = if selected { "› " } else { "  " };
-    let content = format!("{}{}", marker, text);
-    box_text(&content, inner_width)
-}
-
-fn fit_name(name: std::borrow::Cow<'_, str>) -> String {
-    let width = terminal::size()
-        .map(|(columns, _)| columns as usize)
-        .unwrap_or(100);
-    truncate_text(&name, (width / 3).max(16))
-}
-
-fn fit_path(path: &Path, name_len: usize) -> String {
-    let width = terminal::size()
-        .map(|(columns, _)| columns as usize)
-        .unwrap_or(100);
-    let available = width.saturating_sub(name_len + 8).max(12);
-    let text = path.to_string_lossy();
-    truncate_text(&text, available)
-}
-
-fn truncate_text(text: &str, available: usize) -> String {
-    if text.chars().count() <= available {
-        return text.to_string();
-    }
-    let suffix: String = text
-        .chars()
-        .rev()
-        .take(available.saturating_sub(3))
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect();
-    format!("...{suffix}")
-}
 fn print_best(paths: &[PathBuf], query: &str) -> Result<(), Box<dyn std::error::Error>> {
     if let Some((path, _)) = rank(paths, query).first() {
         println!("{}", path.display());
@@ -854,6 +626,7 @@ fn settings() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn ranks_exact_before_partial() {
         let a = PathBuf::from("/tmp/Mascotify");
@@ -861,8 +634,16 @@ mod tests {
         let result = rank(&[b, a.clone()], "mascotify");
         assert_eq!(result[0].0, a);
     }
+
     #[test]
     fn fuzzy_handles_typo() {
         assert!(fuzzy_score(Path::new("/tmp/Mascotify"), "mascotfy").is_some());
+    }
+
+    #[test]
+    fn result_start_keeps_selected_row_visible() {
+        assert_eq!(result_start(10, 0, 3), 0);
+        assert_eq!(result_start(10, 4, 3), 2);
+        assert_eq!(result_start(10, 9, 3), 7);
     }
 }

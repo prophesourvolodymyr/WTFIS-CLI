@@ -1,7 +1,7 @@
 wtfis() {
   local output status selected
   output="$(mktemp "${TMPDIR:-/tmp}/wtfis.XXXXXX")" || return
-  WTFIS_OUTPUT="$output" command wtfis "$@" </dev/tty >/dev/tty 2>/dev/tty
+  WTFIS_OUTPUT="$output" command wtfis "$@" >/dev/tty 2>/dev/tty
   status=$?
   if [ "$status" -eq 0 ] && [ -s "$output" ]; then
     selected="$(<"$output")"
