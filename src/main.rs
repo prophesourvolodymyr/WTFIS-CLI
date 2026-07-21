@@ -263,12 +263,19 @@ fn picker(
         .map(|(_, rows)| rows.clamp(12, 20))
         .unwrap_or(16);
     let backend = CrosstermBackend::new(io::stdout());
-    let mut ui_terminal = Terminal::with_options(
+    let mut ui_terminal = match Terminal::with_options(
         backend,
         TerminalOptions {
             viewport: Viewport::Inline(height),
         },
-    )?;
+    ) {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            terminal::disable_raw_mode()?;
+            eprintln!("wtfis: inline viewport unavailable ({error}); using compatible mode");
+            return picker_compatible(roots, scan_hidden, exact_depth, recent, initial, prepared);
+        }
+    };
     execute!(ui_terminal.backend_mut(), EnableMouseCapture)?;
     let mut query = initial.to_string();
     let mut selected = 0usize;
@@ -371,6 +378,101 @@ fn picker(
     execute!(ui_terminal.backend_mut(), DisableMouseCapture)?;
     ui_terminal.clear()?;
     ui_terminal.show_cursor()?;
+    Ok(result)
+}
+
+fn picker_compatible(
+    roots: &[PathBuf],
+    scan_hidden: bool,
+    exact_depth: Option<usize>,
+    recent: &[PathBuf],
+    initial: &str,
+    prepared: Option<Vec<PathBuf>>,
+) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
+    terminal::enable_raw_mode()?;
+    let mut out = io::stderr();
+    execute!(out, cursor::SavePosition)?;
+    let mut query = initial.to_string();
+    let mut selected = 0usize;
+    let mut rendered_lines = 0usize;
+    let mut paths = prepared;
+    let mut scan_receiver: Option<Receiver<Vec<PathBuf>>> = None;
+    let mut scanning = false;
+    let result = loop {
+        if !query.is_empty() && paths.is_none() && scan_receiver.is_none() {
+            scan_receiver = Some(start_scan(roots.to_vec(), scan_hidden, exact_depth));
+            scanning = true;
+        }
+        if let Some(receiver) = &scan_receiver {
+            if let Ok(found_paths) = receiver.try_recv() {
+                paths = Some(found_paths);
+                scan_receiver = None;
+                scanning = false;
+            }
+        }
+        let recent_results: Vec<_> = recent
+            .iter()
+            .take(MAX_RECENTS)
+            .cloned()
+            .map(|path| (path, 0))
+            .collect();
+        let results = if query.is_empty() {
+            recent_results
+        } else {
+            rank(paths.as_deref().unwrap_or_default(), &query)
+        };
+        selected = selected.min(results.len().saturating_sub(1));
+        rendered_lines = render(
+            &mut out,
+            &query,
+            &results,
+            selected,
+            rendered_lines,
+            scanning,
+        )?;
+        if !event::poll(Duration::from_millis(100))? {
+            continue;
+        }
+        match event::read()? {
+            Event::Key(KeyEvent {
+                code: KeyCode::Esc, ..
+            }) => break None,
+            Event::Key(KeyEvent {
+                code: KeyCode::Enter,
+                ..
+            }) => break results.get(selected).map(|item| item.0.clone()),
+            Event::Key(KeyEvent {
+                code: KeyCode::Up, ..
+            }) => selected = selected.saturating_sub(1),
+            Event::Key(KeyEvent {
+                code: KeyCode::Down,
+                ..
+            }) => selected = (selected + 1).min(results.len().saturating_sub(1)),
+            Event::Key(KeyEvent {
+                code: KeyCode::Backspace,
+                ..
+            }) => {
+                query.pop();
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('c'),
+                modifiers,
+                ..
+            }) if modifiers.contains(KeyModifiers::CONTROL) => break None,
+            Event::Key(KeyEvent {
+                code: KeyCode::Char(c),
+                ..
+            }) => query.push(c),
+            _ => {}
+        }
+    };
+    terminal::disable_raw_mode()?;
+    execute!(
+        out,
+        cursor::RestorePosition,
+        Clear(ClearType::FromCursorDown),
+        cursor::MoveToColumn(0)
+    )?;
     Ok(result)
 }
 
