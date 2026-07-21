@@ -17,7 +17,7 @@ use crossterm::{
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
-const MAX_RESULTS: usize = 8;
+const MAX_RECENTS: usize = 5;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Config {
@@ -178,7 +178,6 @@ fn rank(paths: &[PathBuf], query: &str) -> Vec<(PathBuf, i64)> {
         .filter_map(|path| fuzzy_score(path, &query).map(|score| (path.clone(), score)))
         .collect();
     results.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    results.truncate(MAX_RESULTS);
     results
 }
 
@@ -250,7 +249,7 @@ fn picker(
         }
         let recent_results: Vec<_> = recent
             .iter()
-            .take(MAX_RESULTS.min(5))
+            .take(MAX_RECENTS)
             .cloned()
             .map(|path| (path, 0))
             .collect();
@@ -351,6 +350,18 @@ fn render(
             cursor::MoveToColumn(0)
         )?;
     }
+    let terminal_height = terminal::size()
+        .map(|(_, rows)| rows as usize)
+        .unwrap_or(24);
+    let visible_count = terminal_height.saturating_sub(6).max(1);
+    let start = if results.len() <= visible_count {
+        0
+    } else {
+        selected
+            .saturating_sub(visible_count - 1)
+            .min(results.len() - visible_count)
+    };
+    let end = (start + visible_count).min(results.len());
     queue!(
         out,
         cursor::MoveToColumn(0),
@@ -373,13 +384,18 @@ fn render(
         SetAttribute(Attribute::Reset),
         Print("\n")
     )?;
-    for (index, (path, _)) in results.iter().enumerate() {
-        let name = path.file_name().unwrap_or_default().to_string_lossy();
-        let path_text = fit_path(path, name.len());
+    for (index, (path, _)) in results[start..end].iter().enumerate() {
+        let actual_index = start + index;
+        let name = fit_name(path.file_name().unwrap_or_default().to_string_lossy());
+        let path_text = fit_path(path, name.chars().count());
         queue!(
             out,
-            Print(if index == selected { "  > " } else { "    " }),
-            SetAttribute(if index == selected {
+            Print(if actual_index == selected {
+                "  > "
+            } else {
+                "    "
+            }),
+            SetAttribute(if actual_index == selected {
                 Attribute::Bold
             } else {
                 Attribute::Reset
@@ -408,15 +424,33 @@ fn render(
             Print("\n")
         )?;
     }
+    let navigation = if results.is_empty() {
+        "  ↑/↓ navigate  Enter open  Esc cancel".to_string()
+    } else {
+        format!(
+            "  {}-{} of {}  ↑/↓ navigate  Enter open  Esc cancel",
+            start + 1,
+            end,
+            results.len()
+        )
+    };
     queue!(
         out,
         SetForegroundColor(Color::DarkGrey),
-        Print("\n  ↑/↓ navigate  Enter open  Esc cancel"),
+        Print("\n"),
+        Print(navigation),
         ResetColor,
         cursor::MoveToColumn(0)
     )?;
     out.flush()?;
-    Ok(results.len() + 2 + usize::from(results.is_empty()))
+    Ok(end.saturating_sub(start) + 2 + usize::from(results.is_empty()))
+}
+
+fn fit_name(name: std::borrow::Cow<'_, str>) -> String {
+    let width = terminal::size()
+        .map(|(columns, _)| columns as usize)
+        .unwrap_or(100);
+    truncate_text(&name, (width / 3).max(16))
 }
 
 fn fit_path(path: &Path, name_len: usize) -> String {
@@ -425,13 +459,17 @@ fn fit_path(path: &Path, name_len: usize) -> String {
         .unwrap_or(100);
     let available = width.saturating_sub(name_len + 8).max(12);
     let text = path.to_string_lossy();
+    truncate_text(&text, available)
+}
+
+fn truncate_text(text: &str, available: usize) -> String {
     if text.chars().count() <= available {
-        return text.into_owned();
+        return text.to_string();
     }
     let suffix: String = text
         .chars()
         .rev()
-        .take(available.saturating_sub(4))
+        .take(available.saturating_sub(3))
         .collect::<String>()
         .chars()
         .rev()
