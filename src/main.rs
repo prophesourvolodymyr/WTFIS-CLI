@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 const MAX_RECENTS: usize = 5;
+const MAX_MATCHES: usize = 12;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Config {
@@ -45,16 +46,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = load_config();
     let roots = config.roots.clone().unwrap_or_else(default_roots);
     let recent = config.recent.clone().unwrap_or_default();
+    let projects = if query.is_empty() {
+        None
+    } else {
+        Some(scan(
+            &roots,
+            config.scan_hidden.unwrap_or(false),
+            config.exact_depth,
+        ))
+    };
+    if let Some(projects) = &projects {
+        let exact: Vec<_> = projects
+            .iter()
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case(&query))
+            })
+            .collect();
+        if exact.len() == 1 {
+            let path = exact[0].clone();
+            remember(&mut config, path.clone())?;
+            println!("{}", path.display());
+            return Ok(());
+        }
+    }
     if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
         if query.is_empty() {
             return Ok(());
         }
-        let projects = scan(
-            &roots,
-            config.scan_hidden.unwrap_or(false),
-            config.exact_depth,
-        );
-        return print_best(&projects, &query);
+        return print_best(projects.as_deref().unwrap_or_default(), &query);
     }
     let selected = picker(
         &roots,
@@ -62,6 +82,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.exact_depth,
         &recent,
         &query,
+        projects,
     )?;
     if let Some(path) = selected {
         remember(&mut config, path.clone())?;
@@ -178,6 +199,7 @@ fn rank(paths: &[PathBuf], query: &str) -> Vec<(PathBuf, i64)> {
         .filter_map(|path| fuzzy_score(path, &query).map(|score| (path.clone(), score)))
         .collect();
     results.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    results.truncate(MAX_MATCHES);
     results
 }
 
@@ -225,13 +247,14 @@ fn picker(
     exact_depth: Option<usize>,
     recent: &[PathBuf],
     initial: &str,
+    prepared: Option<Vec<PathBuf>>,
 ) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
     terminal::enable_raw_mode()?;
     let mut out = io::stderr();
     let mut query = initial.to_string();
     let mut selected = 0usize;
     let mut rendered_lines = 0usize;
-    let mut paths = None;
+    let mut paths = prepared;
     let mut scan_receiver: Option<Receiver<Vec<PathBuf>>> = None;
     let mut scanning = false;
     let result = loop {
@@ -350,10 +373,14 @@ fn render(
             cursor::MoveToColumn(0)
         )?;
     }
+    let terminal_width = terminal::size()
+        .map(|(columns, _)| columns as usize)
+        .unwrap_or(100);
+    let inner_width = terminal_width.saturating_sub(4).max(32);
     let terminal_height = terminal::size()
         .map(|(_, rows)| rows as usize)
         .unwrap_or(24);
-    let visible_count = terminal_height.saturating_sub(6).max(1);
+    let visible_count = terminal_height.saturating_sub(11).max(1);
     let start = if results.len() <= visible_count {
         0
     } else {
@@ -366,45 +393,63 @@ fn render(
         out,
         cursor::MoveToColumn(0),
         Clear(ClearType::FromCursorDown),
+        Print(box_border(inner_width, '-')),
+        Print("\n"),
         SetForegroundColor(Color::Cyan),
-        Print("  ◆ wtfis "),
+        Print(box_text("  ◆  W T F I S", inner_width)),
+        ResetColor,
+        Print("\n"),
+        SetForegroundColor(Color::DarkGrey),
+        Print(box_text(
+            "     where the fuck is your project?",
+            inner_width
+        )),
+        ResetColor,
+        Print("\n"),
+        SetForegroundColor(Color::Cyan),
+        Print("  | "),
         ResetColor,
         Print(if query.is_empty() {
-            "Recent projects  "
+            "Recent projects  ["
         } else {
-            "Search projects  "
+            "Search projects  ["
         }),
         SetAttribute(Attribute::Bold),
-        Print("["),
         Print(query),
         SetForegroundColor(Color::Cyan),
         Print("|"),
         ResetColor,
         Print("]"),
-        SetAttribute(Attribute::Reset),
+        Print(&" ".repeat(inner_width.saturating_sub(query.chars().count() + 22))),
+        SetForegroundColor(Color::Cyan),
+        Print(" |\n"),
+        ResetColor,
+        Print(box_border(inner_width, '-')),
         Print("\n")
     )?;
     for (index, (path, _)) in results[start..end].iter().enumerate() {
         let actual_index = start + index;
         let name = fit_name(path.file_name().unwrap_or_default().to_string_lossy());
         let path_text = fit_path(path, name.chars().count());
+        let row = format!("▸ {}  {}", name, path_text);
         queue!(
             out,
-            Print(if actual_index == selected {
-                "  > "
+            SetForegroundColor(if actual_index == selected {
+                Color::White
             } else {
-                "    "
+                Color::DarkGrey
             }),
             SetAttribute(if actual_index == selected {
                 Attribute::Bold
             } else {
                 Attribute::Reset
             }),
-            Print(name),
+            Print(box_text_with_marker(
+                &row,
+                inner_width,
+                actual_index == selected,
+            )),
             SetAttribute(Attribute::Reset),
-            SetForegroundColor(Color::DarkGrey),
-            Print("  "),
-            Print(path_text),
             ResetColor,
             Print("\n")
         )?;
@@ -413,13 +458,16 @@ fn render(
         queue!(
             out,
             SetForegroundColor(Color::DarkGrey),
-            Print(if scanning {
-                "    Scanning folders..."
-            } else if query.is_empty() {
-                "    Type to search folders"
-            } else {
-                "    No matching folders"
-            }),
+            Print(box_text(
+                if scanning {
+                    "  ◌  Scanning folders..."
+                } else if query.is_empty() {
+                    "  ◇  Type to search folders"
+                } else {
+                    "  ×  No matching folders"
+                },
+                inner_width
+            )),
             ResetColor,
             Print("\n")
         )?;
@@ -437,13 +485,42 @@ fn render(
     queue!(
         out,
         SetForegroundColor(Color::DarkGrey),
-        Print("\n"),
-        Print(navigation),
+        Print(box_text(&navigation, inner_width)),
         ResetColor,
-        cursor::MoveToColumn(0)
+        Print("\n"),
+        SetForegroundColor(Color::Cyan),
+        Print(box_border(inner_width, '-')),
+        ResetColor
     )?;
     out.flush()?;
-    Ok(end.saturating_sub(start) + 2 + usize::from(results.is_empty()))
+    Ok(end.saturating_sub(start) + 6 + usize::from(results.is_empty()))
+}
+
+fn box_border(inner_width: usize, character: char) -> String {
+    format!("  +{}+", character.to_string().repeat(inner_width))
+}
+
+fn box_text(text: &str, inner_width: usize) -> String {
+    let text = truncate_line(text, inner_width);
+    format!(
+        "  | {}{} |",
+        text,
+        " ".repeat(inner_width.saturating_sub(text.chars().count()))
+    )
+}
+
+fn truncate_line(text: &str, available: usize) -> String {
+    if text.chars().count() <= available {
+        return text.to_string();
+    }
+    let prefix: String = text.chars().take(available.saturating_sub(3)).collect();
+    format!("{prefix}...")
+}
+
+fn box_text_with_marker(text: &str, inner_width: usize, selected: bool) -> String {
+    let marker = if selected { "› " } else { "  " };
+    let content = format!("{}{}", marker, text);
+    box_text(&content, inner_width)
 }
 
 fn fit_name(name: std::borrow::Cow<'_, str>) -> String {
