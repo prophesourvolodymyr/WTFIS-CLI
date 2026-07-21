@@ -22,6 +22,7 @@ struct Config {
     roots: Option<Vec<PathBuf>>,
     scan_hidden: Option<bool>,
     exact_depth: Option<usize>,
+    recent: Option<Vec<PathBuf>>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -39,31 +40,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return settings();
     }
     let query = args.join(" ");
-    let config = load_config();
-    let roots = config.roots.unwrap_or_else(default_roots);
-    let projects = scan(
+    let mut config = load_config();
+    let roots = config.roots.clone().unwrap_or_else(default_roots);
+    let recent = config.recent.clone().unwrap_or_default();
+    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+        if query.is_empty() {
+            return Ok(());
+        }
+        let projects = scan(
+            &roots,
+            config.scan_hidden.unwrap_or(false),
+            config.exact_depth,
+        );
+        return print_best(&projects, &query);
+    }
+    let selected = picker(
         &roots,
         config.scan_hidden.unwrap_or(false),
         config.exact_depth,
-    );
-    if projects.is_empty() {
-        eprintln!("wtfis: no directories found in configured roots");
-        return Ok(());
-    }
-    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
-        return print_best(&projects, &query);
-    }
-    let selected = if query.is_empty() {
-        picker(&projects, "")?
-    } else {
-        let matches = rank(&projects, &query);
-        if matches.first().is_some_and(|(_, score)| *score == 0) {
-            picker(&projects, &query)?
-        } else {
-            picker(&projects, &query)?
-        }
-    };
+        &recent,
+        &query,
+    )?;
     if let Some(path) = selected {
+        remember(&mut config, path.clone())?;
         println!("{}", path.display());
     }
     Ok(())
@@ -181,14 +180,34 @@ fn fuzzy_score(path: &Path, query: &str) -> Option<i64> {
     Some(score - (text.len() as i64 / 10))
 }
 
-fn picker(paths: &[PathBuf], initial: &str) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
+fn picker(
+    roots: &[PathBuf],
+    scan_hidden: bool,
+    exact_depth: Option<usize>,
+    recent: &[PathBuf],
+    initial: &str,
+) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
     terminal::enable_raw_mode()?;
     let mut out = io::stderr();
     let mut query = initial.to_string();
     let mut selected = 0usize;
     let mut rendered_lines = 0usize;
+    let mut paths = None;
     let result = loop {
-        let results = rank(paths, &query);
+        if !query.is_empty() && paths.is_none() {
+            paths = Some(scan(roots, scan_hidden, exact_depth));
+        }
+        let recent_results: Vec<_> = recent
+            .iter()
+            .take(MAX_RESULTS.min(5))
+            .cloned()
+            .map(|path| (path, 0))
+            .collect();
+        let results = if query.is_empty() {
+            recent_results
+        } else {
+            rank(paths.as_deref().unwrap_or_default(), &query)
+        };
         selected = selected.min(results.len().saturating_sub(1));
         rendered_lines = render(&mut out, &query, &results, selected, rendered_lines)?;
         if !event::poll(Duration::from_millis(100))? {
@@ -223,13 +242,31 @@ fn picker(paths: &[PathBuf], initial: &str) -> Result<Option<PathBuf>, Box<dyn s
             Event::Key(KeyEvent {
                 code: KeyCode::Char(c),
                 ..
-            }) => query.push(c),
+            }) => {
+                query.push(c);
+                if paths.is_none() {
+                    paths = Some(scan(roots, scan_hidden, exact_depth));
+                }
+            }
             _ => {}
         }
     };
     terminal::disable_raw_mode()?;
     clear_inline(&mut out)?;
     Ok(result)
+}
+
+fn remember(config: &mut Config, path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let recent = config.recent.get_or_insert_with(Vec::new);
+    recent.retain(|item| item != &path);
+    recent.insert(0, path);
+    recent.truncate(5);
+    let path = config_path().ok_or("cannot determine config directory")?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, toml::to_string_pretty(config)?)?;
+    Ok(())
 }
 
 fn render(
@@ -253,7 +290,11 @@ fn render(
         SetForegroundColor(Color::Cyan),
         Print("  wtfis "),
         ResetColor,
-        Print("Search projects: "),
+        Print(if query.is_empty() {
+            "Recent projects: "
+        } else {
+            "Search projects: "
+        }),
         SetAttribute(Attribute::Bold),
         Print(query),
         SetAttribute(Attribute::Reset),
@@ -283,7 +324,11 @@ fn render(
         queue!(
             out,
             SetForegroundColor(Color::DarkGrey),
-            Print("    No matching folders"),
+            Print(if query.is_empty() {
+                "    Type to search folders"
+            } else {
+                "    No matching folders"
+            }),
             ResetColor,
             Print("\n")
         )?;
@@ -359,6 +404,7 @@ fn settings() -> Result<(), Box<dyn std::error::Error>> {
             roots: Some(roots),
             scan_hidden: Some(false),
             exact_depth: None,
+            recent: load_config().recent,
         })?,
     )?;
     println!("Settings saved.");

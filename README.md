@@ -30,6 +30,8 @@ wtfis --set              # configure search roots
 
 V1 uses local fuzzy matching and scans your complete home directory when it opens. Use `wtfis --set` to narrow the scan to one or more roots. It does not upload paths or project data. Semantic search is planned for V2.
 
+Launching `wtfis` with no query does not scan the filesystem. It opens immediately with up to five recently opened folders; scanning begins when you type the first search character.
+
 The configuration also supports `exact_depth` when a root should expose only one directory level, for example `roots = ["/Users/you/GSpace"]` with `exact_depth = 2` searches `GSpace/<group>/<project>` and nothing deeper.
 
 ## Development
