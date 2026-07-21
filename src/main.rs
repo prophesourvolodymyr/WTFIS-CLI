@@ -373,10 +373,11 @@ fn render(
             cursor::MoveToColumn(0)
         )?;
     }
-    let terminal_width = terminal::size()
-        .map(|(columns, _)| columns as usize)
-        .unwrap_or(100);
-    let inner_width = terminal_width.saturating_sub(4).max(32);
+    let terminal_width = match terminal::size() {
+        Ok((columns, _)) if columns > 0 => columns as usize,
+        _ => 72,
+    };
+    let inner_width = terminal_width.saturating_sub(6).max(32);
     let terminal_height = terminal::size()
         .map(|(_, rows)| rows as usize)
         .unwrap_or(24);
@@ -389,6 +390,15 @@ fn render(
             .min(results.len() - visible_count)
     };
     let end = (start + visible_count).min(results.len());
+    let search_label = if query.is_empty() {
+        "Recent projects  ["
+    } else {
+        "Search projects  ["
+    };
+    let query_width = inner_width.saturating_sub(search_label.chars().count() + 2);
+    let displayed_query = truncate_line(query, query_width);
+    let search_padding = inner_width
+        .saturating_sub(search_label.chars().count() + displayed_query.chars().count() + 2);
     queue!(
         out,
         cursor::MoveToColumn(0),
@@ -409,18 +419,14 @@ fn render(
         SetForegroundColor(Color::Cyan),
         Print("  | "),
         ResetColor,
-        Print(if query.is_empty() {
-            "Recent projects  ["
-        } else {
-            "Search projects  ["
-        }),
+        Print(search_label),
         SetAttribute(Attribute::Bold),
-        Print(query),
+        Print(displayed_query),
         SetForegroundColor(Color::Cyan),
         Print("|"),
         ResetColor,
         Print("]"),
-        Print(&" ".repeat(inner_width.saturating_sub(query.chars().count() + 22))),
+        Print(&" ".repeat(search_padding)),
         SetForegroundColor(Color::Cyan),
         Print(" |\n"),
         ResetColor,
@@ -497,7 +503,7 @@ fn render(
 }
 
 fn box_border(inner_width: usize, character: char) -> String {
-    format!("  +{}+", character.to_string().repeat(inner_width))
+    format!("  +{}+", character.to_string().repeat(inner_width + 2))
 }
 
 fn box_text(text: &str, inner_width: usize) -> String {
