@@ -2,6 +2,8 @@ use std::{
     env, fs,
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
+    sync::mpsc::{self, Receiver},
+    thread,
     time::Duration,
 };
 
@@ -87,6 +89,9 @@ fn load_config() -> Config {
 }
 
 fn scan(roots: &[PathBuf], scan_hidden: bool, exact_depth: Option<usize>) -> Vec<PathBuf> {
+    if let Some(depth) = exact_depth {
+        return scan_exact_depth(roots, scan_hidden, depth);
+    }
     let mut paths = Vec::new();
     for root in roots {
         let walker = WalkDir::new(root)
@@ -113,6 +118,41 @@ fn scan(roots: &[PathBuf], scan_hidden: bool, exact_depth: Option<usize>) -> Vec
     paths.sort();
     paths.dedup();
     paths
+}
+
+fn scan_exact_depth(roots: &[PathBuf], scan_hidden: bool, depth: usize) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for root in roots {
+        let first_level = directory_children(root, scan_hidden);
+        if depth == 1 {
+            paths.extend(first_level);
+            continue;
+        }
+        for group in first_level {
+            if depth == 2 {
+                paths.extend(directory_children(&group, scan_hidden));
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn directory_children(path: &Path, scan_hidden: bool) -> Vec<PathBuf> {
+    fs::read_dir(path)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let child = entry.path();
+            if entry.file_type().ok()?.is_dir() && !ignored_directory(&child, scan_hidden) {
+                Some(child)
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 fn ignored_directory(path: &Path, scan_hidden: bool) -> bool {
@@ -193,9 +233,20 @@ fn picker(
     let mut selected = 0usize;
     let mut rendered_lines = 0usize;
     let mut paths = None;
+    let mut scan_receiver: Option<Receiver<Vec<PathBuf>>> = None;
+    let mut scanning = false;
     let result = loop {
-        if !query.is_empty() && paths.is_none() {
-            paths = Some(scan(roots, scan_hidden, exact_depth));
+        if !query.is_empty() && paths.is_none() && scan_receiver.is_none() {
+            let roots = roots.to_vec();
+            scan_receiver = Some(start_scan(roots, scan_hidden, exact_depth));
+            scanning = true;
+        }
+        if let Some(receiver) = &scan_receiver {
+            if let Ok(found_paths) = receiver.try_recv() {
+                paths = Some(found_paths);
+                scan_receiver = None;
+                scanning = false;
+            }
         }
         let recent_results: Vec<_> = recent
             .iter()
@@ -209,7 +260,14 @@ fn picker(
             rank(paths.as_deref().unwrap_or_default(), &query)
         };
         selected = selected.min(results.len().saturating_sub(1));
-        rendered_lines = render(&mut out, &query, &results, selected, rendered_lines)?;
+        rendered_lines = render(
+            &mut out,
+            &query,
+            &results,
+            selected,
+            rendered_lines,
+            scanning,
+        )?;
         if !event::poll(Duration::from_millis(100))? {
             continue;
         }
@@ -244,9 +302,6 @@ fn picker(
                 ..
             }) => {
                 query.push(c);
-                if paths.is_none() {
-                    paths = Some(scan(roots, scan_hidden, exact_depth));
-                }
             }
             _ => {}
         }
@@ -254,6 +309,18 @@ fn picker(
     terminal::disable_raw_mode()?;
     clear_inline(&mut out)?;
     Ok(result)
+}
+
+fn start_scan(
+    roots: Vec<PathBuf>,
+    scan_hidden: bool,
+    exact_depth: Option<usize>,
+) -> Receiver<Vec<PathBuf>> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = sender.send(scan(&roots, scan_hidden, exact_depth));
+    });
+    receiver
 }
 
 fn remember(config: &mut Config, path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
@@ -275,6 +342,7 @@ fn render(
     results: &[(PathBuf, i64)],
     selected: usize,
     rendered_lines: usize,
+    scanning: bool,
 ) -> io::Result<usize> {
     if rendered_lines > 0 {
         queue!(
@@ -288,15 +356,20 @@ fn render(
         cursor::MoveToColumn(0),
         Clear(ClearType::FromCursorDown),
         SetForegroundColor(Color::Cyan),
-        Print("  wtfis "),
+        Print("  ◆ wtfis "),
         ResetColor,
         Print(if query.is_empty() {
-            "Recent projects: "
+            "Recent projects  "
         } else {
-            "Search projects: "
+            "Search projects  "
         }),
         SetAttribute(Attribute::Bold),
+        Print("["),
         Print(query),
+        SetForegroundColor(Color::Cyan),
+        Print("|"),
+        ResetColor,
+        Print("]"),
         SetAttribute(Attribute::Reset),
         Print("\n")
     )?;
@@ -324,7 +397,9 @@ fn render(
         queue!(
             out,
             SetForegroundColor(Color::DarkGrey),
-            Print(if query.is_empty() {
+            Print(if scanning {
+                "    Scanning folders..."
+            } else if query.is_empty() {
                 "    Type to search folders"
             } else {
                 "    No matching folders"
@@ -336,7 +411,7 @@ fn render(
     queue!(
         out,
         SetForegroundColor(Color::DarkGrey),
-        Print("\n  Up/Down move  Enter open  Esc cancel"),
+        Print("\n  ↑/↓ navigate  Enter open  Esc cancel"),
         ResetColor,
         cursor::MoveToColumn(0)
     )?;
