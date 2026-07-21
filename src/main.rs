@@ -260,6 +260,8 @@ fn render(
         Print("\n")
     )?;
     for (index, (path, _)) in results.iter().enumerate() {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let path_text = fit_path(path, name.len());
         queue!(
             out,
             Print(if index == selected { "  > " } else { "    " }),
@@ -268,11 +270,11 @@ fn render(
             } else {
                 Attribute::Reset
             }),
-            Print(path.file_name().unwrap_or_default().to_string_lossy()),
+            Print(name),
             SetAttribute(Attribute::Reset),
             SetForegroundColor(Color::DarkGrey),
             Print("  "),
-            Print(path.display()),
+            Print(path_text),
             ResetColor,
             Print("\n")
         )?;
@@ -295,6 +297,26 @@ fn render(
     )?;
     out.flush()?;
     Ok(results.len() + 2 + usize::from(results.is_empty()))
+}
+
+fn fit_path(path: &Path, name_len: usize) -> String {
+    let width = terminal::size()
+        .map(|(columns, _)| columns as usize)
+        .unwrap_or(100);
+    let available = width.saturating_sub(name_len + 8).max(12);
+    let text = path.to_string_lossy();
+    if text.chars().count() <= available {
+        return text.into_owned();
+    }
+    let suffix: String = text
+        .chars()
+        .rev()
+        .take(available.saturating_sub(4))
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    format!("...{suffix}")
 }
 fn clear_inline(out: &mut impl Write) -> io::Result<()> {
     execute!(
