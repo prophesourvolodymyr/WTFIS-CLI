@@ -21,6 +21,7 @@ const MAX_RESULTS: usize = 8;
 struct Config {
     roots: Option<Vec<PathBuf>>,
     scan_hidden: Option<bool>,
+    exact_depth: Option<usize>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -40,7 +41,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let query = args.join(" ");
     let config = load_config();
     let roots = config.roots.unwrap_or_else(default_roots);
-    let projects = scan(&roots, config.scan_hidden.unwrap_or(false));
+    let projects = scan(
+        &roots,
+        config.scan_hidden.unwrap_or(false),
+        config.exact_depth,
+    );
     if projects.is_empty() {
         eprintln!("wtfis: no directories found in configured roots");
         return Ok(());
@@ -82,16 +87,21 @@ fn load_config() -> Config {
         .unwrap_or_default()
 }
 
-fn scan(roots: &[PathBuf], scan_hidden: bool) -> Vec<PathBuf> {
+fn scan(roots: &[PathBuf], scan_hidden: bool, exact_depth: Option<usize>) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     for root in roots {
-        for entry in WalkDir::new(root)
+        let walker = WalkDir::new(root)
             .follow_links(false)
-            .into_iter()
+            .max_depth(exact_depth.unwrap_or(usize::MAX))
+            .into_iter();
+        for entry in walker
             .filter_entry(|entry| !ignored_directory(entry.path(), scan_hidden))
             .filter_map(Result::ok)
         {
-            if !entry.file_type().is_dir() || entry.depth() == 0 {
+            if !entry.file_type().is_dir()
+                || entry.depth() == 0
+                || exact_depth.is_some_and(|depth| entry.depth() != depth)
+            {
                 continue;
             }
             let path = entry.path();
@@ -326,6 +336,7 @@ fn settings() -> Result<(), Box<dyn std::error::Error>> {
         toml::to_string_pretty(&Config {
             roots: Some(roots),
             scan_hidden: Some(false),
+            exact_depth: None,
         })?,
     )?;
     println!("Settings saved.");
