@@ -66,23 +66,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn default_roots() -> Vec<PathBuf> {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
-    [
-        "Projects",
-        "Developer",
-        "dev",
-        "code",
-        "src",
-        "repos",
-        "workspace",
-        "GSpace",
-        "Documents",
-        "Desktop",
-        "Downloads",
-    ]
-    .into_iter()
-    .map(|name| home.join(name))
-    .filter(|path| path.is_dir())
-    .collect()
+    // V1 searches the complete home directory by default. Users can narrow
+    // this with `wtfis --set`; this avoids silently missing projects in an
+    // uncommon folder while keeping the scan away from system directories.
+    vec![home]
 }
 
 fn config_path() -> Option<PathBuf> {

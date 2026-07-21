@@ -28,7 +28,7 @@ cdd Mascotify            # short alias
 wtfis --set              # configure search roots
 ```
 
-V1 uses local fuzzy matching and scans configured roots when it opens. It does not upload paths or project data. Semantic search is planned for V2.
+V1 uses local fuzzy matching and scans your complete home directory when it opens. Use `wtfis --set` to narrow the scan to one or more roots. It does not upload paths or project data. Semantic search is planned for V2.
 
 ## Development
 
