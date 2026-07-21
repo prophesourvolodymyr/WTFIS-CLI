@@ -251,6 +251,7 @@ fn picker(
 ) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
     terminal::enable_raw_mode()?;
     let mut out = io::stderr();
+    execute!(out, cursor::SavePosition)?;
     let mut query = initial.to_string();
     let mut selected = 0usize;
     let mut rendered_lines = 0usize;
@@ -329,7 +330,12 @@ fn picker(
         }
     };
     terminal::disable_raw_mode()?;
-    clear_inline(&mut out)?;
+    execute!(
+        out,
+        cursor::RestorePosition,
+        Clear(ClearType::FromCursorDown),
+        cursor::MoveToColumn(0)
+    )?;
     Ok(result)
 }
 
@@ -366,13 +372,7 @@ fn render(
     rendered_lines: usize,
     scanning: bool,
 ) -> io::Result<usize> {
-    if rendered_lines > 0 {
-        queue!(
-            out,
-            cursor::MoveUp(rendered_lines as u16),
-            cursor::MoveToColumn(0)
-        )?;
-    }
+    let _ = rendered_lines;
     let terminal_width = match terminal::size() {
         Ok((columns, _)) if columns > 0 => columns as usize,
         _ => 72,
@@ -401,6 +401,7 @@ fn render(
         .saturating_sub(search_label.chars().count() + displayed_query.chars().count() + 2);
     queue!(
         out,
+        cursor::RestorePosition,
         cursor::MoveToColumn(0),
         Clear(ClearType::FromCursorDown),
         Print(box_border(inner_width, '-')),
@@ -558,13 +559,6 @@ fn truncate_text(text: &str, available: usize) -> String {
         .rev()
         .collect();
     format!("...{suffix}")
-}
-fn clear_inline(out: &mut impl Write) -> io::Result<()> {
-    execute!(
-        out,
-        cursor::MoveToColumn(0),
-        Clear(ClearType::FromCursorDown)
-    )
 }
 fn print_best(paths: &[PathBuf], query: &str) -> Result<(), Box<dyn std::error::Error>> {
     if let Some((path, _)) = rank(paths, query).first() {
