@@ -15,13 +15,20 @@ use crossterm::{
     },
     execute, queue,
     style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor},
-    terminal::{self, Clear, ClearType, DisableLineWrap, EnableLineWrap},
+    terminal::{self, Clear, ClearType},
+};
+use ratatui::{
+    Terminal, TerminalOptions, Viewport,
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout},
+    style::{Color as TuiColor, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Borders, List, ListItem, Paragraph},
 };
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 const MAX_RECENTS: usize = 5;
-const MAX_MATCHES: usize = 12;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Config {
@@ -202,7 +209,6 @@ fn rank(paths: &[PathBuf], query: &str) -> Vec<(PathBuf, i64)> {
         .filter_map(|path| fuzzy_score(path, &query).map(|score| (path.clone(), score)))
         .collect();
     results.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    results.truncate(MAX_MATCHES);
     results
 }
 
@@ -253,16 +259,19 @@ fn picker(
     prepared: Option<Vec<PathBuf>>,
 ) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
     terminal::enable_raw_mode()?;
-    let mut out = io::stderr();
-    execute!(
-        out,
-        DisableLineWrap,
-        cursor::SavePosition,
-        EnableMouseCapture
+    let height = terminal::size()
+        .map(|(_, rows)| rows.clamp(12, 20))
+        .unwrap_or(16);
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut ui_terminal = Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(height),
+        },
     )?;
+    execute!(ui_terminal.backend_mut(), EnableMouseCapture)?;
     let mut query = initial.to_string();
     let mut selected = 0usize;
-    let mut rendered_lines = 0usize;
     let mut paths = prepared;
     let mut scan_receiver: Option<Receiver<Vec<PathBuf>>> = None;
     let mut scanning = false;
@@ -292,14 +301,7 @@ fn picker(
             rank(paths.as_deref().unwrap_or_default(), &query)
         };
         selected = selected.min(results.len().saturating_sub(1));
-        rendered_lines = render(
-            &mut out,
-            &query,
-            &results,
-            selected,
-            rendered_lines,
-            scanning,
-        )?;
+        ui_terminal.draw(|frame| render_frame(frame, &query, &results, selected, scanning))?;
         if !event::poll(Duration::from_millis(100))? {
             continue;
         }
@@ -338,10 +340,8 @@ fn picker(
             Event::Mouse(mouse)
                 if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) =>
             {
-                let terminal_height = terminal::size()
-                    .map(|(_, rows)| rows as usize)
-                    .unwrap_or(24);
-                let visible_count = terminal_height.saturating_sub(8).max(1);
+                let viewport = ui_terminal.get_frame().area();
+                let visible_count = viewport.height.saturating_sub(8).max(1) as usize;
                 let start = if results.len() <= visible_count {
                     0
                 } else {
@@ -349,7 +349,7 @@ fn picker(
                         .saturating_sub(visible_count - 1)
                         .min(results.len() - visible_count)
                 };
-                let first_result_row = 5usize;
+                let first_result_row = viewport.y as usize + 4;
                 let clicked_row = mouse.row as usize;
                 if clicked_row >= first_result_row
                     && clicked_row < first_result_row + results.len().min(visible_count)
@@ -368,14 +368,9 @@ fn picker(
         }
     };
     terminal::disable_raw_mode()?;
-    execute!(
-        out,
-        DisableMouseCapture,
-        cursor::RestorePosition,
-        Clear(ClearType::FromCursorDown),
-        EnableLineWrap,
-        cursor::MoveToColumn(0)
-    )?;
+    execute!(ui_terminal.backend_mut(), DisableMouseCapture)?;
+    ui_terminal.clear()?;
+    ui_terminal.show_cursor()?;
     Ok(result)
 }
 
@@ -411,6 +406,109 @@ fn emit_path(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", path.display());
     }
     Ok(())
+}
+
+fn render_frame(
+    frame: &mut ratatui::Frame<'_>,
+    query: &str,
+    results: &[(PathBuf, i64)],
+    selected: usize,
+    scanning: bool,
+) {
+    let block = ratatui::widgets::Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(TuiColor::Cyan))
+        .title(" ◆  W T F I S ")
+        .title_bottom(" where the fuck is your project? ");
+    let inner = block.inner(frame.area());
+    frame.render_widget(block, frame.area());
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    let label = if query.is_empty() {
+        "Recent projects  ["
+    } else {
+        "Search projects  ["
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(label, Style::default().fg(TuiColor::White)),
+            Span::styled(query, Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled("|]", Style::default().fg(TuiColor::Cyan)),
+        ])),
+        sections[0],
+    );
+    frame.render_widget(
+        Paragraph::new("  ↑/↓ navigate  Enter open  Esc cancel")
+            .style(Style::default().fg(TuiColor::DarkGray)),
+        sections[1],
+    );
+    let visible_count = sections[3].height.max(1) as usize;
+    let start = if results.len() <= visible_count {
+        0
+    } else {
+        selected
+            .saturating_sub(visible_count - 1)
+            .min(results.len() - visible_count)
+    };
+    let end = (start + visible_count).min(results.len());
+    let items: Vec<ListItem> = results[start..end]
+        .iter()
+        .enumerate()
+        .map(|(index, (path, _))| {
+            let actual = start + index;
+            let row = format!(
+                "{} ▸ {}  {}",
+                if actual == selected { "›" } else { " " },
+                path.file_name().unwrap_or_default().to_string_lossy(),
+                path.display()
+            );
+            let style = if actual == selected {
+                Style::default()
+                    .fg(TuiColor::White)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(TuiColor::DarkGray)
+            };
+            ListItem::new(Line::from(Span::styled(row, style)))
+        })
+        .collect();
+    if items.is_empty() {
+        let message = if scanning {
+            "  ◌  Scanning folders..."
+        } else if query.is_empty() {
+            "  ◇  Type to search folders"
+        } else {
+            "  ×  No matching folders"
+        };
+        frame.render_widget(
+            Paragraph::new(message).style(Style::default().fg(TuiColor::DarkGray)),
+            sections[3],
+        );
+    } else {
+        frame.render_widget(List::new(items), sections[3]);
+    }
+    let navigation = if results.is_empty() {
+        "↑/↓ navigate  Enter open  Esc cancel".to_string()
+    } else {
+        format!(
+            "{}-{} of {}  ↑/↓ navigate  Enter open  Esc cancel",
+            start + 1,
+            end,
+            results.len()
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(navigation).style(Style::default().fg(TuiColor::DarkGray)),
+        sections[4],
+    );
 }
 
 fn render(
